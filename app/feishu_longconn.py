@@ -4,8 +4,7 @@
   1. 收到 @机器人 / 单聊文本消息 → 立即给原消息加表情回应（"GET"），让用户知道收到
   2. 在独立 worker 线程把消息送给 vm_agent.agent_invoke()
   3. 拿到回复后，**回复**原消息（保留上下文链路），群聊里带上 `<at user_id="xxx">` @ 发送者
-  4. 重置关键词（清空 / 重置 / /reset 等） → 直接重置该 session 的上下文，不调用 LLM
-  5. message_id 去重（10 分钟 TTL）防止飞书重投
+  4. message_id 去重（10 分钟 TTL）防止飞书重投
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-from app.agent.vm_agent import agent_invoke, reset_session
+from app.agent.vm_agent import agent_invoke
 from app.config import get_settings
 from app.observability.audit import audit_log, setup_logging
 from app.services.feishu_client import FeishuClient
@@ -71,21 +70,9 @@ def _parse_text(content: str | None) -> str:
     return ""
 
 
-_RESET_KEYWORDS: frozenset[str] = frozenset({
-    "/reset", "/clear", "/new", "/restart",
-    "reset", "clear", "restart",
-    "清空", "清除", "重置", "新话题", "新会话", "重新开始",
-    "清空上下文", "重置会话", "重置上下文", "清空会话", "清空历史",
-})
-_RESET_STRIP_RE = re.compile(r"[\s\u3000，。！？、,.!?]+")
-_MENTION_RE = re.compile(r"<at[^>]*>.*?</at>|@\S+")
-
-
-def _is_reset_command(text: str) -> bool:
-    if not text:
-        return False
-    normalized = _RESET_STRIP_RE.sub("", _MENTION_RE.sub("", text)).lower()
-    return normalized in _RESET_KEYWORDS
+# 提及匹配：<at>...</at> 块，或「行首/空白后」的 @xxx。
+# 用 (?:^|(?<=\s)) 限定 @ 必须在开头或空白后，避免把邮箱（如 user@domain.com）的 @ 域名误删。
+_MENTION_RE = re.compile(r"<at[^>]*>.*?</at>|(?:^|(?<=\s))@\S+")
 
 
 def _strip_mentions(text: str) -> str:
@@ -161,12 +148,6 @@ def build_longconn_client() -> "lark.ws.Client":
     def _handle(text: str, session_id: str, chat_type: str, chat_id: str, message_id: str, open_id: str | None) -> None:
         t0 = time.perf_counter()
         try:
-            if _is_reset_command(text):
-                reset_session(session_id)
-                _reply(lark_client, chat_type, chat_id, message_id, open_id,
-                       "✅ 当前会话上下文已清空，可以开始新话题。")
-                return
-
             clean_text = _strip_mentions(text)
             reply_text = agent_invoke(clean_text, session_id=session_id)
             if not reply_text:

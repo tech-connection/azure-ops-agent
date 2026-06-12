@@ -44,7 +44,7 @@ def _content_skill_from_md(dir_name: str) -> Skill:
 
 # ─────────────────── 注册到 Microsoft Agent Framework ───────────────────
 def build_vm_skills() -> list[Skill]:
-    """构造 8 个纯 content 型 Skill 对象，注册给 SkillsProvider。
+    """构造 9 个纯 content 型 Skill 对象，注册给 SkillsProvider。
 
     全部为 content 型：文档为社区标准 SKILL.md（位于 app/skills/<name>/SKILL.md，
     可交付、客户可编辑），执行由模型按 SKILL.md 写明的 az 命令经全局 `run_az` 工具完成，
@@ -59,4 +59,5 @@ def build_vm_skills() -> list[Skill]:
         _content_skill_from_md("service-health-check"),  # 同上：订阅级 Service Health 平台事件（az rest 调 ResourceHealth/events，判断是否有平台级故障）
         _content_skill_from_md("vm-full-diagnosis"),  # 同上：整体体检走 SKILL.md + run_az（合并编排五维指标，共享步骤只跑一次）
         _content_skill_from_md("azure-qa"),  # 轻量：SKILL.md 驱动的通识问答 + 能力边界兜底（合并自原 vm-unsupported-metric），LLM 直接回答，无脚本
+        _content_skill_from_md("azure-support-case"),  # 提交 Azure 支持工单：SKILL.md 驱动，用户确认后经 run_az 调 az support 建单（唯一受控写操作）
     ]
