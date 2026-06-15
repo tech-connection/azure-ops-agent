@@ -94,12 +94,12 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 
 ## 判断标准（写“结论”时参考）
 
-**只看最近一条（时间倒序的第 1 条，即当前/最新状态）来定结论，不要因为历史里有过维护就判异常：**
+**结论看「最近一条有可用性状态的记录」——即时间倒序里第一条 `state` 非 null 的记录（第 1 条可能是 `state=null` 的计划维护记录，如 `Freeze Update Succeeded`，需跳过，否则会误读成 `Unknown`）；用户给了时间窗时，只在 `time` 落在窗内的记录里取，不要因为历史里有过维护就判异常：**
 
 | 结论 | 判定条件 |
 | --- | --- |
-| ✅ 正常 | 最近一条事件的 `state` 为 `Available`（或为已成功完成、已恢复的计划内维护）→ 说明当前没问题 |
-| ❌ 异常 | 最近一条事件的 `state` 为 `Unavailable` / `Degraded`（VM 当前被判定不可用 / 降级） |
+| ✅ 正常 | 最近一条有状态的记录 `state` 为 `Available`（或为已成功完成、已恢复的计划内维护）→ 说明当前没问题 |
+| ❌ 异常 | 最近一条有状态的记录 `state` 为 `Unavailable` / `Degraded`（VM 被判定不可用 / 降级） |
 
 > 历史里的计划维护、Freeze/Storage 更新等只要后续已恢复 `Available`，**不影响“正常”结论**，仅作为详细数据列出供参考。
 > 若用户对**历史事件**仍有疑问（如想确认某次停顿/重启的根因、影响范围），统一建议**提单 Azure Support** 进一步核查，本技能不臆断历史根因。

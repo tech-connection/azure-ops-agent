@@ -132,10 +132,12 @@ az monitor metrics list --resource <vm_name> --resource-group <resource_group> \
 az rest --method get --url "https://management.azure.com/subscriptions/<subId>/resourceGroups/<resource_group>/providers/Microsoft.Compute/virtualMachines/<vm_name>/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2024-02-01&$expand=recommendedactions" --query "value[].{time:properties.occuredTime, state:properties.availabilityState, title:properties.title, cause:properties.healthEventCause, summary:properties.summary}" -o json
 ```
 
-数组已按时间倒序，**第 1 条为当前/最新状态**；`time` 是 UTC，+8 小时换算北京时间。
-- **当前平台状态** = 第 1 条的 `state`（`Available` = 平台侧正常）。
-- **诊断窗内是否有平台事件**：逐条看 `time`，只要有任意一条落在本次诊断时间窗 `[start, end]` 内，即「窗内有平台事件」（计划维护 / Unavailable / Degraded 等）。
-- **用途**：CPU 指标若判为异常，且窗内有平台事件或当前非 `Available` → 在结论里点明异常**可能与底层平台有关**；若窗内无事件且当前 `Available` → 可排除平台因素，问题更可能在业务/系统侧。
+数组按时间倒序，每条是一次**健康状态变化**（Resource Health 只在状态变化时记一条，状态延续到下次变化，不是逐分钟数据）。`time` 是 UTC，+8 小时换算北京时间。少数记录是计划维护描述（如 `Freeze Update Succeeded`），其 `state`(availabilityState) 为 **null**，不是“状态未知”。
+
+**判定只看诊断时间窗 `[start, end]` 内的记录，窗口外的历史一律不展示、不参与判断**：
+- **诊断窗内平台事件** = `time` 落在 `[start, end]` 内的记录（含计划维护与可用性变化）；窗内无任何记录 → 写「无」。
+- **窗口内是否正常**：窗内无记录 → 平台侧无事件，判正常（不要回看窗外去找“当前状态”，那会把几周前的旧状态 / `Unknown` 误当成本次结果）；窗内有记录 → 看窗内**最新一条 `state` 非 null** 的记录，`Available` = 正常，`Unavailable` / `Degraded` = 异常。
+- **用途**：CPU 指标若判为异常，且窗内有非 `Available` 事件 → 在结论里点明异常**可能与底层平台有关**；窗内无事件或均 `Available` → 可排除平台因素，问题更可能在业务/系统侧。
 
 ## 判断阈值（写“结论”时参考）
 
@@ -151,7 +153,7 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 
 ```
 🔧 诊断模式（数据来源：Azure Monitor + Resource Health 实时查询）
-诊断时间范围：<起始北京时间> ~ <结束北京时间>（采样间隔 1 分钟，北京时间）
+诊断时间范围：<起始北京时间> ~ <结束北京时间>（北京时间）
 
 一、主机信息
   实例 ID：<name>
@@ -178,8 +180,8 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
   高位占比（≥90%）：<高位占比>%（<high_minutes>/<total_minutes> 分钟）
 
 四、运行状况（Resource Health）
-  当前平台状态：<Available=正常 / Unavailable / Degraded / Unknown>
-  诊断窗内平台事件：<无 / 有：简述最相关一条（北京时间 + 计划内/计划外 + 简要说明）>
+  诊断窗内平台事件：<无 / 有：简述 time∈[start,end] 的最相关一条（北京时间 + 计划内/计划外 + 简要说明）>
+  窗口内平台状态：<窗内有记录→取窗内最新一条 state（Available=正常 / Unavailable / Degraded）；窗内无记录→无平台事件（视为正常）>
 ```
 
 - 数值保留 1 位小数（如 `9.9`）。

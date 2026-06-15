@@ -83,25 +83,29 @@ az disk show -g <rg> -n <diskName> --query "{sku:sku.name, sizeGB:diskSizeGB, ti
 - 若 `tier` 为空 → 按 `sku` 判断系列（Premium→P 系、StandardSSD→E 系、Standard_LRS→S 系），再用 `sizeGB` 向上取整到最近档位查表。
 - 若 `sku` 为 `PremiumV2_LRS` / `UltraSSD_LRS` → 上限由用户在盘上自定义，**直接用步骤 3 返回的 `iops`/`mbps`**（即 `diskIOPSReadWrite`/`diskMBpsReadWrite`）作为上限，不查表。若这两个值为 null，说明字段名写错了（注意 IOPS 全大写）。
 
-### 步骤 5：查询 OS 盘实测指标（逐分钟明细，用于同分钟合计）
+### 步骤 5：查询 OS 盘实测指标（逐区间明细，用于同区间合计）
 
-用 `run_az` 执行（返回每个指标的逐分钟序列，含时间戳，供同分钟对齐）：
+> **采样粒度 `<interval>` 按时间窗长短动态选（磁盘查询返回逐区间序列，窗口越长点越多；点太多会把返回体撞爆、被截断导致误判 N/A）：**
+> - 窗口 ≤ 2 小时 → `PT1M`；2–12 小时 → `PT5M`；12–48 小时 → `PT15M`；> 48 小时 → `PT1H`。
+> - 聚合用 `Maximum`，**更大 interval 仍取区间内最大瞬时值，不漏峰值**，只是峰值时间定位变粗；读/写仍同时间戳对齐，可照常同区间相加。OS 盘与数据盘查询用同一个 `<interval>`。
+
+用 `run_az` 执行（返回每个指标的逐区间序列，含时间戳，供同区间对齐）：
 
 ```bash
-az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "OS Disk Read Operations/Sec" "OS Disk Write Operations/Sec" "OS Disk Read Bytes/sec" "OS Disk Write Bytes/sec" "OS Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "OS Disk Read Operations/Sec" "OS Disk Write Operations/Sec" "OS Disk Read Bytes/sec" "OS Disk Write Bytes/sec" "OS Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
 ```
 
-返回 OS 盘 5 个指标的逐分钟 `{t, v}` 序列（读 IOPS、写 IOPS、读吞吐字节/秒、写吞吐字节/秒、延迟毫秒）。按「计算口径」做同分钟对齐求峰。
+返回 OS 盘 5 个指标的逐区间 `{t, v}` 序列（读 IOPS、写 IOPS、读吞吐字节/秒、写吞吐字节/秒、延迟毫秒）。按「计算口径」做同区间对齐求峰。
 
 ### 步骤 6：查询全部数据盘实测指标（一次拿全部 LUN）
 
 用 `run_az` 执行**一次**（`LUN eq '*'` 一次返回每个 LUN 一条序列，比逐 LUN 多次调用少很多往返）：
 
 ```bash
-az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Data Disk Read Operations/Sec" "Data Disk Write Operations/Sec" "Data Disk Read Bytes/sec" "Data Disk Write Bytes/sec" "Data Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --filter "LUN eq '*'" --query "value[].{m:name.value, series:timeseries[].{lun:metadatavalues[0].value, data:data[?maximum!=null].{t:timeStamp, v:maximum}}}" -o json
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Data Disk Read Operations/Sec" "Data Disk Write Operations/Sec" "Data Disk Read Bytes/sec" "Data Disk Write Bytes/sec" "Data Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --filter "LUN eq '*'" --query "value[].{m:name.value, series:timeseries[].{lun:metadatavalues[0].value, data:data[?maximum!=null].{t:timeStamp, v:maximum}}}" -o json
 ```
 
-返回每个指标下、按 LUN 分组的逐分钟 `{t, v}` 序列。用 `lun` 把同一块盘的 5 个指标对应起来，再按「计算口径」同分钟对齐求峰。
+返回每个指标下、按 LUN 分组的逐区间 `{t, v}` 序列（`<interval>` 同步骤 5 的选取规则）。用 `lun` 把同一块盘的 5 个指标对应起来，再按「计算口径」同区间对齐求峰。
 
 ### 步骤 7：运行状况（Resource Health，判断异常是否与底层平台有关）
 
@@ -111,10 +115,12 @@ az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Mi
 az rest --method get --url "https://management.azure.com/subscriptions/<subId>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachines/<vm>/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2024-02-01&$expand=recommendedactions" --query "value[].{time:properties.occuredTime, state:properties.availabilityState, title:properties.title, cause:properties.healthEventCause, summary:properties.summary}" -o json
 ```
 
-数组已按时间倒序，**第 1 条为当前/最新状态**；`time` 是 UTC，+8 小时换算北京时间。
-- **当前平台状态** = 第 1 条的 `state`（`Available` = 平台侧正常）。
-- **诊断窗内是否有平台事件**：逐条看 `time`，只要有任意一条落在本次诊断时间窗 `[start, end]` 内，即「窗内有平台事件」（计划维护 / Unavailable / Degraded 等）。
-- **用途**：磁盘指标若判为异常，且窗内有平台事件或当前非 `Available` → 在结论里点明异常**可能与底层平台有关**；若窗内无事件且当前 `Available` → 可排除平台因素，问题更可能在业务/系统侧。
+数组按时间倒序，每条是一次**健康状态变化**（Resource Health 只在状态变化时记一条，状态延续到下次变化，不是逐分钟数据）。`time` 是 UTC，+8 小时换算北京时间。少数记录是计划维护描述（如 `Freeze Update Succeeded`），其 `state`(availabilityState) 为 **null**，不是“状态未知”。
+
+**判定只看诊断时间窗 `[start, end]` 内的记录，窗口外的历史一律不展示、不参与判断**：
+- **诊断窗内平台事件** = `time` 落在 `[start, end]` 内的记录（含计划维护与可用性变化）；窗内无任何记录 → 写「无」。
+- **窗口内是否正常**：窗内无记录 → 平台侧无事件，判正常（不要回看窗外去找“当前状态”，那会把几周前的旧状态 / `Unknown` 误当成本次结果）；窗内有记录 → 看窗内**最新一条 `state` 非 null** 的记录，`Available` = 正常，`Unavailable` / `Degraded` = 异常。
+- **用途**：磁盘指标若判为异常，且窗内有非 `Available` 事件 → 在结论里点明异常**可能与底层平台有关**；窗内无事件或均 `Available` → 可排除平台因素，问题更可能在业务/系统侧。
 
 ## 计算口径
 
@@ -209,7 +215,7 @@ VM 级：
 
 ```
 🔧 诊断模式（数据来源：Azure Monitor + Resource Health 实时查询）
-诊断时间范围：<起始北京时间> ~ <结束北京时间>（采样间隔 1 分钟，北京时间）
+诊断时间范围：<起始北京时间> ~ <结束北京时间>（北京时间）
 
 一、主机信息
   实例 ID：<name>
@@ -261,8 +267,8 @@ VM 级：
   [VM 级未缓存上限] IOPS=<UncachedDiskIOPS>，吞吐=<未缓存吞吐 MB/s> MB/s
 
 四、运行状况（Resource Health）
-  当前平台状态：<Available=正常 / Unavailable / Degraded / Unknown>
-  诊断窗内平台事件：<无 / 有：简述最相关一条（北京时间 + 计划内/计划外 + 简要说明）>
+  诊断窗内平台事件：<无 / 有：简述 time∈[start,end] 的最相关一条（北京时间 + 计划内/计划外 + 简要说明）>
+  窗口内平台状态：<窗内有记录→取窗内最新一条 state（Available=正常 / Unavailable / Degraded）；窗内无记录→无平台事件（视为正常）>
 ```
 
 - 数据盘**按「档位 + 磁盘类型」分组**：每组标题行 `[数据盘·<等级> / <类型> ×<块数>]`。

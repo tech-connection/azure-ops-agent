@@ -85,11 +85,15 @@ az network nic show --ids <primaryNicId> --query "{accel:enableAcceleratedNetwor
 ### 步骤 4：查询入/出带宽峰值
 
 ```
-az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Network In Total" "Network Out Total" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Network In Total" "Network Out Total" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, peak:max_by(timeseries[0].data[?maximum!=null], &maximum)}" -o json
 ```
 
-返回入/出带宽的逐分钟 `{t, v}` 序列（单位**字节**）。各取序列里最大的 `v` 为峰值字节数，
-**÷ 1048576 转为 MB/s**，并记录该峰值点的时间戳（UTC +8h → 北京时间）。
+**注意：查询里用 `max_by(...)` 让 az 服务端直接算出峰值点，不要改成返回整段逐分钟序列**（长时间窗下整段序列会有上千个点，返回体过大会被截断，导致你误以为“没取到数据”而填 N/A）。
+
+返回每个指标的峰值点 `peak = {timeStamp, maximum}`（单位**字节**，为该分钟内总量）。
+- 取 `peak.maximum` 为峰值字节数，`peak.timeStamp` 为峰值时间（UTC +8h → 北京时间）。
+- **带宽单位自适应**（避免小值被四舍五入成 0.0 看起来像无数据）：峰值字节数 `b`——若 `b >= 1048576` 用 `b/1048576` 表为 `MB`（保留 1–2 位小数）；若 `1024 <= b < 1048576` 用 `b/1024` 表为 `KB`；若 `b < 1024` 直接用 `B`。单位随值标在数字后。
+- **只有查询确实没返回任何数据点（`peak` 为空/null）才写 N/A**；只要有值，哪怕很小也要按上面单位换算如实展示，不得因“太小”写 N/A。
 
 ### 步骤 5：查询入/出连接数（Flows）峰值
 
@@ -98,7 +102,7 @@ az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Mi
 - **未开 AC** → 连接数从 **VM** 资源取（指标名 `Inbound Flows` / `Outbound Flows`）：
 
   ```
-  az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Inbound Flows" "Outbound Flows" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
+  az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Inbound Flows" "Outbound Flows" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, peak:max_by(timeseries[0].data[?maximum!=null], &maximum)}" -o json
   ```
 
   数据来源标记为 **VM**。
@@ -107,12 +111,14 @@ az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Mi
   用步骤 1 的主网卡 `id` 作为 `--resource`：
 
   ```
-  az monitor metrics list --resource <primaryNicId> --resource-type Microsoft.Network/networkInterfaces --metric "CurrentTotalFlowsIn" "CurrentTotalFlowsOut" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
+  az monitor metrics list --resource <primaryNicId> --resource-type Microsoft.Network/networkInterfaces --metric "CurrentTotalFlowsIn" "CurrentTotalFlowsOut" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, peak:max_by(timeseries[0].data[?maximum!=null], &maximum)}" -o json
   ```
 
   把 `CurrentTotalFlowsIn` 当作入站连接、`CurrentTotalFlowsOut` 当作出站连接，数据来源标记为 **NIC**。
 
-各取序列里最大的 `v` 为入/出站连接峰值（单位 flows，取整），并记录峰值时间。
+**同样用 `max_by(...)` 让 az 服务端直接返回峰值点，不要改成返回整段序列。**
+取 `peak.maximum` 为入/出站连接峰值（单位 flows，取整），`peak.timeStamp` 为峰值时间（UTC +8h → 北京）。
+**仅当 `peak` 为空/null（查询确实无数据）才写 N/A。**
 
 ### 步骤 6：运行状况（Resource Health，判断异常是否与底层平台有关）
 
@@ -122,10 +128,12 @@ az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Mi
 az rest --method get --url "https://management.azure.com/subscriptions/<subId>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachines/<vm>/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2024-02-01&$expand=recommendedactions" --query "value[].{time:properties.occuredTime, state:properties.availabilityState, title:properties.title, cause:properties.healthEventCause, summary:properties.summary}" -o json
 ```
 
-数组已按时间倒序，**第 1 条为当前/最新状态**；`time` 是 UTC，+8 小时换算北京时间。
-- **当前平台状态** = 第 1 条的 `state`（`Available` = 平台侧正常）。
-- **诊断窗内是否有平台事件**：逐条看 `time`，只要有任意一条落在本次诊断时间窗 `[start, end]` 内，即「窗内有平台事件」（计划维护 / Unavailable / Degraded 等）。
-- **用途**：网络指标若判为异常，且窗内有平台事件或当前非 `Available` → 在结论里点明异常**可能与底层平台有关**；若窗内无事件且当前 `Available` → 可排除平台因素，问题更可能在业务/系统侧。
+数组按时间倒序，每条是一次**健康状态变化**（Resource Health 只在状态变化时记一条，不是逐分钟连续数据；状态会一直延续到下次变化）。`time` 是 UTC，+8 小时换算北京时间。**注意**：少数记录是计划维护描述（如 `Freeze Update Succeeded`），其 `state`(availabilityState) 为 **null**，并不代表“状态未知”，不可当可用性状态用。
+
+判定只看**诊断时间窗 `[start, end]`** 内的记录，窗口外的历史一律不展示、不参与判断：
+- **诊断窗内平台事件**：只列 `time` 落在 `[start, end]` 内的记录（含计划维护与可用性变化）；窗内无任何记录 → 写「无」。
+- **窗口内是否正常**：窗内无记录 → 平台侧无事件，判正常（不要回看窗外去找“当前状态”，那会把几周前的旧状态 / `Unknown` 误当成本次结果）；窗内有记录 → 看窗内**最新一条 `state` 非 null** 的记录，`Available` = 正常，`Unavailable` / `Degraded` = 异常。
+- **用途**：网络指标若判为异常，且窗内有非 `Available` 事件 → 在结论里点明异常**可能与底层平台有关**；窗内无事件或均 `Available` → 可排除平台因素，问题更可能在业务/系统侧。
 
 ## 连接数上限对照表
 
@@ -162,8 +170,11 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 
 | 结论 | 判定条件 |
 | --- | --- |
-| ✅ 正常 | 连接数峰值**未达到**有效上限 |
-| ❌ 异常 | 连接数峰值**达到或超过**有效上限（已触顶，可能丢连接 / 建连失败） |
+| ⚠️ 无法判定 | 连接数峰值为 N/A（两个方向的连接数查询都无数据） |
+| ✅ 正常 | 拿到连接数数据，且峰值**未达到**有效上限 |
+| ❌ 异常 | 拿到连接数数据，且峰值**达到或超过**有效上限（已触顶，可能丢连接 / 建连失败） |
+
+> **重要：没拿到连接数指标（峰值 N/A）时绝不能判“✅ 正常”。**无数据就是“⚠️ 无法判定”，结论里如实说明“本次未取到连接数指标，无法给出正常/异常结论”，并提示可能原因（该时间窗无数据 / VM 当时未运行 / 时间窗太早超出保留期）和建议（换个时间窗重试）。不要“无数据但当作正常”。
 
 - **连接数瓶颈**：峰值达到/超过有效上限 → 建议开启或升级加速连接（AC，auxSku A1→A8 上限递增）、或拆分流量到多 VM。
 - **加速网卡未启用**：若 `accel==false`，在建议里提示开启加速网卡可显著降低延迟、提升 PPS（需停机改配）。
@@ -173,7 +184,7 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 
 ```
 🔧 诊断模式（数据来源：Azure Monitor + Resource Health 实时查询）
-诊断时间范围：<起始北京时间> ~ <结束北京时间>（采样间隔 1 分钟，北京时间）
+诊断时间范围：<起始北京时间> ~ <结束北京时间>（北京时间）
 
 一、主机信息
   实例 ID：<name>
@@ -185,7 +196,7 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
   当前状态：<powerState，如 running>
 
 二、结论
-- 是否异常：<✅ 正常 / ❌ 异常>，并简述依据（连接数峰值多少 / 有效上限多少 / 是否触顶）。
+- 是否异常：<✅ 正常 / ❌ 异常 / ⚠️ 无法判定>，并简述依据（连接数峰值多少 / 有效上限多少 / 是否触顶；**未取到连接数指标时写“无法判定”并说明原因，不得写正常**）。
 - 平台关联：<仅在网络判异常时写：诊断窗内有平台事件/当前非 Available → 可能与底层平台有关；无事件且 Available → 已排除平台因素。网络正常时此行可省略>
 - 风险判断：<低 / 中 / 高>，一句话说明（如连接数远低于上限，网络运行稳定）。
 - 建议动作：1) <可执行建议> 2) <可执行建议>（正常则写「无需处理，继续观察」）。
@@ -194,23 +205,23 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 
 ———— 详细数据 ————
 三、网络指标
-  入站带宽峰值：<x.x> MB/s  时间=<峰值北京时间>
-  出站带宽峰值：<x.x> MB/s  时间=<峰值北京时间>
+  入站带宽峰值：<数值><单位 MB/s或KB/s或B/s>  时间=<峰值北京时间>
+  出站带宽峰值：<数值><单位 MB/s或KB/s或B/s>  时间=<峰值北京时间>
   入站连接（Inbound Flows）峰值：<n> flows  时间=<峰值北京时间>  数据来源=<VM/NIC>
   出站连接（Outbound Flows）峰值：<n> flows  时间=<峰值北京时间>  数据来源=<VM/NIC>
   加速网卡：<已启用 / 未启用 / 未知>  AC：<见下方说明>
   连接数有效上限：<有效上限> flows（<档位说明，如 “AC A2” 或 “16–31 vCPU 档”>）
 
 四、运行状况（Resource Health）
-  当前平台状态：<Available=正常 / Unavailable / Degraded / Unknown>
-  诊断窗内平台事件：<无 / 有：简述最相关一条（北京时间 + 计划内/计划外 + 简要说明）>
+  诊断窗内平台事件：<无 / 有：仅列 time∈[start,end] 的记录，简述最相关一条（北京时间 + 计划内/计划外 + 简要说明）>
+  窗口内平台状态：<窗内有记录→取窗内最新一条 state（Available=正常 / Unavailable / Degraded）；窗内无记录→无平台事件（视为正常）>
 ```
 
 - `AC：` 这一行按实际情况写：
   - 已开 AC → `已启用（<auxSku>：连接数上限 <上限/10000> 万）`，例如 `已启用（A2：连接数上限 200 万）`。
   - 未开 AC → `未启用（按 <vCPU 档位> 档位，连接数上限 <非 MANA 上限>`，64+ vCPU 再补 `，开 MANA 可到 2,000,000`，最后加 `）`。
-- 数值：带宽（MB/s）保留 1 位小数；连接数（flows）取整，可用千分位。
-- 时间格式 `YYYY-MM-DD HH:MM:SS`；取不到的值写 N/A，不臆造。
+- 数值：带宽按单位自适应表示（MB/s 保留 1–2 位小数，KB/s 同理，B/s 取整），**小值也要如实转 KB/s 或 B/s 展示，不得因太小写 N/A**；连接数（flows）取整，可用千分位。
+- 时间格式 `YYYY-MM-DD HH:MM:SS`；**只有查询确实无数据时才写 N/A**，不臆造也不要把小值当 N/A。
 - **「一、主机信息」的机型 SKU 行必须完整列出括号内的 vCPU / 内存**（来自步骤 2 的查询），不得只写 SKU 名而省略规格；只有查不到才写 N/A。
 - 直接把组装好的中文报告输出给用户，**不要展示命令或 JSON**。
 

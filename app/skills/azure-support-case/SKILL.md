@@ -152,7 +152,7 @@ args = [
   "--contact-country", "CHN",
   "--contact-language", "zh-hans",
   "--contact-timezone", "China Standard Time",
-  "--additional-contact-emails", "<需要 cc 的邮箱，用户未要求 cc 时整行省略>",
+  "--contact-additional-emails", "<cc邮箱1>", "<cc邮箱2>",
   "--advanced-diagnostic-consent", "Yes",
   "-o", "json"
 ]
@@ -164,7 +164,7 @@ args = [
 - `--technical-resource`：受影响资源的完整 Resource ID（强烈建议带上）。
 - `--contact-email`：**必须填用户提供的完整邮箱**（原样，不截断）；未拿到邮箱则不得执行本命令，先追问。
 - `--contact-first-name` / `--contact-last-name`：用户明给姓名则用用户的；未给时**用邮箱 @ 前缀**填入两者（不必追问姓名）。
-- `--additional-contact-emails`：**CC 抄送邮箱**（附加联系人）。用户要求 cc 某人时填入，多个邮箱用**空格分隔**放在同一个字符串里（如 `"a@x.com b@y.com"`）；用户没要求 cc 就**整行不要写该参数**。
+- `--contact-additional-emails`：**CC 抄送邮箱**（参数名就是 `--contact-additional-emails`，别写反）。用户要求 cc 某人时填入；**多个邮箱要作为多个独立数组元素**（每个邮箱一个元素，不要拼成一个字符串），如：`"--contact-additional-emails", "a@x.com", "b@y.com"`；用户没要求 cc 就**整个参数不要写**。
 - 联系方式固定：method=email、country=CHN（中国）、language=zh-hans（中文）、timezone=China Standard Time（中国）、consent=Yes。
 - **不要**写 `--subscription`：由底层自动注入。
 

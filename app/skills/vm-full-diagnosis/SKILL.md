@@ -136,16 +136,18 @@ az disk show -g <rg> -n <diskName> --query "{sku:sku.name, sizeGB:diskSizeGB, ti
 - `tier` 为空 → 按 `sku` 判系列（Premium→P 系、StandardSSD→E 系、Standard_LRS→S 系），用 `sizeGB` 向上取整到最近档位查表。
 - `sku` 为 `PremiumV2_LRS`/`UltraSSD_LRS` → 上限即步骤 6a 返回的 `iops`/`mbps`，不查表。
 
-6c. OS 盘实测指标（逐分钟明细，用于同分钟合计）：
+6c. OS 盘实测指标（逐区间明细，用于同区间合计）：
+
+> **采样粒度 `<interval>` 按时间窗长短动态选（磁盘查询返回逐区间序列，窗口越长点越多，点太多会撑爆返回体、被截断误判 N/A）：窗口 ≤ 2h → `PT1M`；2–12h → `PT5M`；12–48h → `PT15M`；> 48h → `PT1H`。`Maximum` 聚合下更大 interval 仍取区间内最大瞬时值不漏峰，读/写仍同时间戳对齐。OS 盘与数据盘用同一个 `<interval>`。（CPU/内存/网络已在服务端聚合为标量，继续用 `PT1M`。）**
 
 ```
-az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "OS Disk Read Operations/Sec" "OS Disk Write Operations/Sec" "OS Disk Read Bytes/sec" "OS Disk Write Bytes/sec" "OS Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "OS Disk Read Operations/Sec" "OS Disk Write Operations/Sec" "OS Disk Read Bytes/sec" "OS Disk Write Bytes/sec" "OS Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
 ```
 
-6d. 全部数据盘实测指标（`LUN eq '*'` 一次返回每个 LUN 一条序列）：
+6d. 全部数据盘实测指标（`LUN eq '*'` 一次返回每个 LUN 一条序列，`<interval>` 同 6c）：
 
 ```
-az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Data Disk Read Operations/Sec" "Data Disk Write Operations/Sec" "Data Disk Read Bytes/sec" "Data Disk Write Bytes/sec" "Data Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --filter "LUN eq '*'" --query "value[].{m:name.value, series:timeseries[].{lun:metadatavalues[0].value, data:data[?maximum!=null].{t:timeStamp, v:maximum}}}" -o json
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Data Disk Read Operations/Sec" "Data Disk Write Operations/Sec" "Data Disk Read Bytes/sec" "Data Disk Write Bytes/sec" "Data Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --filter "LUN eq '*'" --query "value[].{m:name.value, series:timeseries[].{lun:metadatavalues[0].value, data:data[?maximum!=null].{t:timeStamp, v:maximum}}}" -o json
 ```
 
 **计算口径（同分钟合计，与 vm-disk-check 一致）**：
@@ -166,13 +168,13 @@ az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Mi
 az rest --method get --url "https://management.azure.com/subscriptions/<subId>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachines/<vm>/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2024-02-01&$expand=recommendedactions" --query "value[].{time:properties.occuredTime, state:properties.availabilityState, title:properties.title, cause:properties.healthEventCause, summary:properties.summary}" -o json
 ```
 
-数组已按时间倒序，**第 1 条为当前/最新状态**。`time` 是 UTC，+8 小时换算北京时间。
+数组按时间倒序，每条是一次**健康状态变化**（Resource Health 只在状态变化时记一条，不是逐分钟连续数据；状态延续到下次变化）。`time` 是 UTC，+8 小时换算北京时间。**注意**：少数记录是计划维护描述（如 `Freeze Update Succeeded`），其 `state`(availabilityState) 为 **null**，不是“状态未知”，不可当可用性状态用。
 
-判断如何展示运行状况（见「输出格式·七」）：
-- **当前状态** = 第 1 条的 `state`（`Available` = 正常）。
-- **诊断窗内是否有事件**：逐条看 `time`，只要有任意一条落在本次诊断时间窗 `[start, end]` 内，即「窗内有事件」。
-- 若当前状态为 `Available` 且**窗内没有任何事件** → 运行状况判正常，详细数据区只输出一行「诊断时间窗内无平台健康事件」，**不要**罗列窗外的历史维护事件。
-- 若当前状态为 `Unavailable` / `Degraded`，或**窗内有事件** → 展开「最近事件 / 说明」，呈现最相关的那条（优先窗内事件，其次最新一条）。
+判断一律以**诊断时间窗 `[start, end]`** 为准（见「输出格式·七」）：
+- **诊断窗内事件** = `time` 落在 `[start, end]` 内的记录（含计划维护与可用性变化）；窗口外的历史记录**一律不展示、不参与判断**。
+- **窗口内是否正常**：窗内无任何记录 → 平台侧无事件，判正常（不要回看窗外找“当前状态”，会把几周前旧状态 / `Unknown` 误当本次结果）；窗内有记录 → 看窗内**最新一条 `state` 非 null** 的记录，`Available` = 正常，`Unavailable` / `Degraded` = 异常。
+- 窗内无事件或最新一条 `Available` → 运行状况判正常，详细数据区只输出一行「诊断时间窗内无平台健康事件」。
+- 窗内最新一条为 `Unavailable` / `Degraded`，或窗内有事件 → 展开「窗内事件 / 说明」，只呈现窗内最相关的那条。
 
 ### 步骤 8：回填校验（组装报告前必做，防止误填 N/A）
 
@@ -250,13 +252,13 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 **内存（两档）**：✅ 正常=高位（≥90%）占比<20%；❌ 异常=高位（≥90%）占比≥20%（均值/峰值仅参考展示）。
 **磁盘（两档，口径同 vm-disk-check）**：✅ 正常=所有盘级与 VM 级的 IOPS / 吞吐峰值均未达各自上限，且所有盘延迟峰值 ≤200ms；❌ 异常=任一盘级或 VM 级 IOPS / 吞吐峰值达到/超过上限，或任一盘延迟峰值 >200ms。
 **网络（两档）**：✅ 正常=入/出连接数峰值中较大者未达有效上限；❌ 异常=达到或超过有效上限（带宽仅参考展示，不单独触发异常）。
-**运行状况（两档）**：✅ 正常=最近一条事件 `state` 为 `Available`（或已恢复的计划维护）；❌ 异常=最近一条为 `Unavailable` / `Degraded`。历史里的已恢复维护不影响结论；用户对历史事件有疑问则建议提单 Azure Support。
+**运行状况（两档）**：✅ 正常=诊断窗内无事件，或窗内最新一条 `state` 为 `Available`（含已恢复的计划维护）；❌ 异常=窗内最新一条 `state` 为 `Unavailable` / `Degraded`。只看窗内记录、不取窗外历史；用户对历史事件有疑问则建议提单 Azure Support。
 
 ## 输出格式（严格照此组装，逐项填值，不要加寒暄/表情/多余前后缀）
 
 ```
 🔧 诊断模式（数据来源：Azure Monitor / Resource Health 实时查询）
-诊断时间范围：<起始北京时间> ~ <结束北京时间>（采样间隔 1 分钟，北京时间）
+诊断时间范围：<起始北京时间> ~ <结束北京时间>（北京时间）
 
 一、主机信息
   实例 ID：<name>
@@ -322,13 +324,13 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 
 七、运行状况（Resource Health）
   <二选一：>
-  当前状况：<state，如 可用>  诊断时间窗内无平台健康事件
-  <或，仅当当前异常或窗内确有事件时：>
-  最近事件：<事件北京时间>  状态=<state 或 title>  原因=<平台发起 / 用户发起 / N/A>
+  窗口内平台状态：<可用（窗内无记录或最新为 Available）>  诊断时间窗内无平台健康事件
+  <或，仅当窗口期异常或窗内确有事件时：>
+  窗内事件：<事件北京时间>  状态=<state 或 title>  原因=<平台发起 / 用户发起 / N/A>
   说明：<summary>
 ```
 
-> 「七、运行状况」二选一：当前 `Available` 且诊断窗内无事件 → 只输出「当前状况 + 诊断时间窗内无平台健康事件」一行，**不要**贴窗外的历史维护事件；当前异常或窗内有事件 → 展开「最近事件 / 说明」。
+> 「七、运行状况」二选一：窗内无事件或窗内最新为 `Available` → 只输出「窗口内平台状态 + 诊断时间窗内无平台健康事件」一行，**不要**贴窗外的历史维护事件；窗内最新为异常或窗内有事件 → 展开「窗内事件 / 说明」。
 
 - **网络 `AC：` 行**（与 vm-network-check 一致）按实际情况写：
   - 已开 AC（`auxMode==AcceleratedConnections` 且 `auxSku` 有效）→ `已启用（<auxSku>：连接数上限 <上限/10000> 万）`，例如 `已启用（A2：连接数上限 200 万）`。
@@ -351,5 +353,5 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 - 启用 AC 的 VM，连接数取自主 NIC（`CurrentTotalFlowsIn/Out`）。
 - 时间一律按北京时间向用户呈现；调用 az 时换算为 UTC。
 - N/A 只能在对应 `run_az` 返回 `null`/空/`error` 时写（多为 VM 已释放或未装 Agent）；**凡返回带数字的维度一律填真实值，禁止有数据却写 N/A**（参见步骤 8 回填校验）。CPU、磁盘为平台 host 指标，正常 VM 必有数据。
-- 运行状况采条件展示：诊断时间窗内无事件且当前可用时，只提示「诊断时间窗内无平台健康事件」，不展示窗外的历史事件。
+- 运行状况采条件展示：诊断时间窗内无事件时，只提示「诊断时间窗内无平台健康事件」，不展示窗外的历史事件。
 - 主机名必填；资源组缺省时使用默认资源组 `xiaomi-azure`，不要追问。
