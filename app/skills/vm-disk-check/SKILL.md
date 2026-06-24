@@ -8,9 +8,9 @@ description: >-
 
 # VM 磁盘诊断技能
 
-本技能对一台 Azure 虚拟机的全部磁盘（OS 盘 + 各数据盘）做**只读**诊断：读取每块盘的
-SKU 上限（IOPS / 吞吐），从 Azure Monitor 拉取实测读写 IOPS、吞吐、延迟峰值，并汇总
-VM 级合计与 VM 未缓存上限对比，给出判断与建议。
+本技能对一台 Azure 虚拟机的全部磁盘（OS 盘 + 各数据盘）做**只读**诊断：从 Azure Monitor
+直接读取每块盘及 VM 级的 IOPS / 吞吐**消耗百分比峰值**与延迟峰值，与阈值对比给出判断与建议；
+同时根据磁盘 SKU 查出每块盘的 IOPS / 吞吐**上限**一并展示（触顶判定以消耗百分比为准，上限仅供直观对照，无需逐分钟读写累加）。
 
 > 本技能**不进入 VM 操作系统内部**，只读取 Azure 控制面的磁盘配置与平台指标。
 > 文件系统级别（哪个目录/文件 IO 高）属于 OS 级深诊断，不在本技能范围内。
@@ -27,7 +27,7 @@ VM 级合计与 VM 未缓存上限对比，给出判断与建议。
 ## 执行步骤
 
 本技能为 **SKILL.md 驱动型**（无脚本）。你将通过全局工具 `run_az` 逐条执行下面的 az CLI 命令，
-然后按「SKU 上限对照表」「判断标准」「输出格式」自行组装中文报告。
+然后按「计算口径」「判断标准」「输出格式」自行组装中文报告。
 
 > 默认资源组：`xiaomi-azure`（用户未显式给出资源组时直接采用，不要追问）。
 > 所有命令都不要带 `--subscription`（后端已注入订阅）。
@@ -53,19 +53,19 @@ az vm get-instance-view -g <rg> -n <vm> --query "instanceView.computerName" -o j
 
 > ⚠️ 若 `powerState` 不是 `VM running`（如 `VM deallocated`），磁盘指标可能缺失，应如实告知用户。
 
-### 步骤 2：查询 VM 未缓存磁盘上限（VM 级瓶颈基准、**必须执行**）
+### 步骤 2：SKU 规格（vCPU / 内存，必查）
 
-用 `run_az` 执行（先从步骤 1 的 `id` 里取 `<subId>`——`/subscriptions/` 之后、下一个 `/` 之前那段；`<loc>`、`<vmSize>` 用步骤 1 的值），调 Compute SKUs API（服务端按 location 过滤，比 `az vm list-skus` 快几十倍）：
+「一、主机信息」机型 SKU 行的 vCPU / 内存来自这里，不得省略或臆造。先从步骤 1 的 `id` 里取 `<subId>`（`/subscriptions/` 之后、下一个 `/` 之前那段），再用 `<loc>`、`<vmSize>` 调 Compute SKUs API（服务端按 location 过滤，比 `az vm list-skus` 快几十倍）：
 
 ```bash
-az rest --method get --url "https://management.azure.com/subscriptions/<subId>/providers/Microsoft.Compute/skus?api-version=2021-07-01&$filter=location eq '<loc>'" --query "value[?name=='<vmSize>'] | [0].capabilities[?name=='vCPUs' || name=='MemoryGB' || name=='UncachedDiskIOPS' || name=='UncachedDiskBytesPerSecond'].{name:name,value:value}" -o json
+az rest --method get --url "https://management.azure.com/subscriptions/<subId>/providers/Microsoft.Compute/skus?api-version=2021-07-01&$filter=location eq '<loc>'" --query "value[?name=='<vmSize>'] | [0].capabilities[?name=='vCPUs' || name=='MemoryGB'].{name:name,value:value}" -o json
 ```
 
-返回四个值：`vCPUs`（vCPU 数）、`MemoryGB`（内存 GB）、`UncachedDiskIOPS`（VM 未缓存 IOPS 上限）、`UncachedDiskBytesPerSecond`（未缓存吞吐上限，单位字节/秒，÷1000000 得 MB/s，如 1735000000 → 1735 MB/s）。其中 `vCPUs` / `MemoryGB` 用于「一、主机信息」的机型 SKU 行（**必须填，不得省略**）。
+返回 `vCPUs`、`MemoryGB`，填入「一、主机信息」的机型 SKU 行（**必须填，不得省略**；真返回空才重试一次）。
 
-> ⚠️ 这一步**不能跳过**。该接口一定能返回这几个值（已验证 Standard_D64s_v5 返回 80000 / 1735000000）。报告里的「[VM 级未缓存上限]」必须填真实数值，**不得写 N/A**；若某次调用真的返回空，重试一次再填。
+> 本技能用 Azure 平台「消耗百分比」指标判断是否触顶（步骤 4–6）；每块盘的绝对上限（IOPS / 吞吐）由步骤 3 根据 SKU 查出后一并展示，仅用于直观对照，不参与触顶判定。VM 未缓存维度直接看 `VM Uncached *Consumed Percentage`，无需另算 VM 上限数值。
 
-### 步骤 3：读取每块盘的档位与容量
+### 步骤 3：读取每块盘的档位、容量与上限
 
 对步骤 1 列出的**每块盘**（OS 盘 + 各数据盘）各执行一次（`<diskName>` 换成盘名）：
 
@@ -73,39 +73,41 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/p
 az disk show -g <rg> -n <diskName> --query "{sku:sku.name, sizeGB:diskSizeGB, tier:tier, iops:diskIOPSReadWrite, mbps:diskMBpsReadWrite}" -o json
 ```
 
-得到该盘的 `sku`（如 `Premium_LRS` / `StandardSSD_LRS` / `Standard_LRS` / `PremiumV2_LRS` / `UltraSSD_LRS`）、容量 `sizeGB`（单位 GB）、档位 `tier`（如 `P4`）。
-其中 `iops`/`mbps`（对应字段 `diskIOPSReadWrite`/`diskMBpsReadWrite`，注意 IOPS 全大写）：**Premium SSD v2 / Ultra 盘会直接返回该盘的自定义上限**（如 iops=3000, mbps=125），其他类型返回 null。
+得该盘 `sku`（如 `Premium_LRS` / `StandardSSD_LRS` / `Standard_LRS` / `PremiumV2_LRS` / `UltraSSD_LRS`）、容量 `sizeGB`、档位 `tier`（如 `P4`，可能为空），以及 `iops`/`mbps`（字段 `diskIOPSReadWrite`/`diskMBpsReadWrite`，IOPS 全大写；**仅 Premium SSD v2 / Ultra 盘返回该盘自定义上限**，其他类型为 null）。
 
-### 步骤 4：查 SKU 上限对照表
+**确定每块盘的 IOPS / 吞吐上限（仅用于展示，触顶判定仍以消耗百分比为准）**：
+- `sku` 为 `PremiumV2_LRS` / `UltraSSD_LRS` → 上限即返回的 `iops` / `mbps`（盘自定义值），不查表。
+- 其他类型 → 用下方「磁盘 SKU 上限对照表」查：`tier` 有值（如 P30/E20/S30）直接按 tier 查；`tier` 为空时按 `sku` 判系列（Premium→P 系、StandardSSD→E 系、Standard_LRS→S 系），用 `sizeGB` 向上取整到第一个 ≥ 容量的档位查表，该行 IOPS / MB/s 即上限，档位名即「等级」。
 
-用步骤 3 的结果，按下方「SKU 上限对照表」查出每块盘的 **IOPS 上限 / 吞吐上限**：
-- 若 `tier` 有值（如 `P4`/`E20`/`S30`）→ 直接按 tier 查表。
-- 若 `tier` 为空 → 按 `sku` 判断系列（Premium→P 系、StandardSSD→E 系、Standard_LRS→S 系），再用 `sizeGB` 向上取整到最近档位查表。
-- 若 `sku` 为 `PremiumV2_LRS` / `UltraSSD_LRS` → 上限由用户在盘上自定义，**直接用步骤 3 返回的 `iops`/`mbps`**（即 `diskIOPSReadWrite`/`diskMBpsReadWrite`）作为上限，不查表。若这两个值为 null，说明字段名写错了（注意 IOPS 全大写）。
+### 步骤 4：查询 OS 盘 IOPS / 吞吐消耗百分比 + 延迟峰值
 
-### 步骤 5：查询 OS 盘实测指标（逐区间明细，用于同区间合计）
-
-> **采样粒度 `<interval>` 按时间窗长短动态选（磁盘查询返回逐区间序列，窗口越长点越多；点太多会把返回体撞爆、被截断导致误判 N/A）：**
-> - 窗口 ≤ 2 小时 → `PT1M`；2–12 小时 → `PT5M`；12–48 小时 → `PT15M`；> 48 小时 → `PT1H`。
-> - 聚合用 `Maximum`，**更大 interval 仍取区间内最大瞬时值，不漏峰值**，只是峰值时间定位变粗；读/写仍同时间戳对齐，可照常同区间相加。OS 盘与数据盘查询用同一个 `<interval>`。
-
-用 `run_az` 执行（返回每个指标的逐区间序列，含时间戳，供同区间对齐）：
+> **采样粒度 `<interval>` 按时间窗长短选**：窗口 ≤ 2 小时 → `PT1M`；2–12 小时 → `PT5M`；12–48 小时 → `PT15M`；> 48 小时 → `PT1H`。聚合用 `Maximum`，`--query` 里用 `max(...)` 让结果只回峰值点，返回体很小（不再因点多被截断）。OS / 数据盘 / VM 三条查询用同一个 `<interval>`。
 
 ```bash
-az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "OS Disk Read Operations/Sec" "OS Disk Write Operations/Sec" "OS Disk Read Bytes/sec" "OS Disk Write Bytes/sec" "OS Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --query "value[].{m:name.value, data:timeseries[0].data[?maximum!=null].{t:timeStamp, v:maximum}}" -o json
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "OS Disk IOPS Consumed Percentage" "OS Disk Bandwidth Consumed Percentage" "OS Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --query "value[].{m:name.value, peak:max(timeseries[0].data[?maximum!=null].maximum), t:max_by(timeseries[0].data[?maximum!=null], &maximum).timeStamp}" -o json
 ```
 
-返回 OS 盘 5 个指标的逐区间 `{t, v}` 序列（读 IOPS、写 IOPS、读吞吐字节/秒、写吞吐字节/秒、延迟毫秒）。按「计算口径」做同区间对齐求峰。
+返回 OS 盘三个指标的峰值 `peak` 与峰值时间 `t`：`OS Disk IOPS Consumed Percentage`、`OS Disk Bandwidth Consumed Percentage` 是 IOPS / 吞吐**消耗百分比**（%），`OS Disk Latency` 是**延迟**（毫秒）。`peak` 为 null/空 → 该窗无数据，写 N/A。
 
-### 步骤 6：查询全部数据盘实测指标（一次拿全部 LUN）
+### 步骤 5：查询全部数据盘 IOPS / 吞吐消耗百分比 + 延迟峰值（一次拿全部 LUN）
 
-用 `run_az` 执行**一次**（`LUN eq '*'` 一次返回每个 LUN 一条序列，比逐 LUN 多次调用少很多往返）：
+用 `run_az` 执行**一次**（`LUN eq '*'` 一次返回每个 LUN 一条序列；`<interval>` 同步骤 4）：
 
 ```bash
-az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Data Disk Read Operations/Sec" "Data Disk Write Operations/Sec" "Data Disk Read Bytes/sec" "Data Disk Write Bytes/sec" "Data Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --filter "LUN eq '*'" --query "value[].{m:name.value, series:timeseries[].{lun:metadatavalues[0].value, data:data[?maximum!=null].{t:timeStamp, v:maximum}}}" -o json
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "Data Disk IOPS Consumed Percentage" "Data Disk Bandwidth Consumed Percentage" "Data Disk Latency" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --filter "LUN eq '*'" --query "value[].{m:name.value, series:timeseries[].{lun:metadatavalues[0].value, peak:max(data[?maximum!=null].maximum), t:max_by(data[?maximum!=null], &maximum).timeStamp}}" -o json
 ```
 
-返回每个指标下、按 LUN 分组的逐区间 `{t, v}` 序列（`<interval>` 同步骤 5 的选取规则）。用 `lun` 把同一块盘的 5 个指标对应起来，再按「计算口径」同区间对齐求峰。
+每个指标下按 LUN 给出该盘峰值 `peak` 与峰值时间 `t`：前两个是 IOPS / 吞吐**消耗百分比峰值**（%），`Data Disk Latency` 是该盘**延迟峰值**（毫秒）。用 `lun` 把同一块盘的三个值与时间对应起来。
+
+### 步骤 6：查询 VM 未缓存 IOPS / 吞吐消耗百分比峰值
+
+用 `run_az` 执行**一次**（`<interval>` 同步骤 4）：
+
+```bash
+az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Microsoft.Compute/virtualMachines --metric "VM Uncached IOPS Consumed Percentage" "VM Uncached Bandwidth Consumed Percentage" --start-time <start-utc> --end-time <end-utc> --interval <interval> --aggregation Maximum --query "value[].{m:name.value, peak:max(timeseries[0].data[?maximum!=null].maximum), t:max_by(timeseries[0].data[?maximum!=null], &maximum).timeStamp}" -o json
+```
+
+得 VM 级未缓存 IOPS / 吞吐**消耗百分比峰值**（%）。这是 VM 规格对全部磁盘 IO 的总瓶颈：单盘没满但此处接近 100%，说明受 VM 规格限制。
 
 ### 步骤 7：运行状况（Resource Health，判断异常是否与底层平台有关）
 
@@ -122,25 +124,21 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 - **窗口内是否正常**：窗内无记录 → 平台侧无事件，判正常（不要回看窗外去找“当前状态”，那会把几周前的旧状态 / `Unknown` 误当成本次结果）；窗内有记录 → 看窗内**最新一条 `state` 非 null** 的记录，`Available` = 正常，`Unavailable` / `Degraded` = 异常。
 - **用途**：磁盘指标若判为异常，且窗内有非 `Available` 事件 → 在结论里点明异常**可能与底层平台有关**；窗内无事件或均 `Available` → 可排除平台因素，问题更可能在业务/系统侧。
 
-## 计算口径
+## 计算口径（消耗百分比，直读峰值）
 
-对每块盘（「同分钟合计」口径，与截图一致）：
-- **合计 IOPS 峰值**：把读 IOPS 与写 IOPS 两个序列**按时间戳 `t` 对齐**，逐分钟求和（读 v + 写 v），取和最大的那一分钟为合计峰值；该分钟的读值、写值即报告里的「读 x / 写 y」，该分钟的时间戳即峰值时间。
-- **合计吞吐峰值（MB/s）**：同理对齐读吞吐与写吞吐序列逐分钟求和，取最大分钟，再 ÷ 1000000 转为 MB/s。
-- **延迟峰值**：延迟是单一序列，无需读写合计，直接取该盘 `Latency` 序列的最大 v（毫秒）及其时间戳。
-- **盘级是否触顶**：把合计 IOPS 峰值与该盘 IOPS 上限直接比较、合计吞吐峰值与该盘吞吐上限直接比较，任一峰值 ≥ 对应上限即触顶（不计算百分比利用率）。
+Azure「消耗百分比」指标本身就是「实测 IO ÷ 对应上限 ×100%」，**直接取峰值与阈值比较即可，无需再查上限、无需逐分钟读写累加、也无需汇总 VM 合计**：
+- **每块盘**：取该盘 IOPS 消耗百分比峰值、吞吐消耗百分比峰值（均 %），以及 `Latency` 延迟峰值（毫秒）。
+- **盘级是否触顶**：该盘任一消耗百分比峰值 **≥ 95%** 即视为已达到 / 接近 IOPS 或吞吐上限（触顶）。
+- **VM 级是否触顶**：`VM Uncached IOPS Consumed Percentage` 或 `VM Uncached Bandwidth Consumed Percentage` 峰值 **≥ 95%** 即 VM 规格层面触顶。
+- **延迟**：任一盘 `Latency` 峰值 > 200ms 视为延迟异常。
 
-VM 级：
-- **VM 合计 IOPS 峰值** = 所有盘（OS + 各数据盘）合计 IOPS 峰值之和。
-- **VM 合计吞吐峰值** = 所有盘合计吞吐峰值之和。
-- **VM 是否触顶**：VM 合计 IOPS 峰值与 `UncachedDiskIOPS` 比较、VM 合计吞吐峰值与 (`UncachedDiskBytesPerSecond` ÷ 1000000) MB/s 比较，任一峰值 ≥ 对应上限即触顶。
+> 消耗百分比是 Azure host 侧实测占用率，封顶 100%（持续 100% 即处于限速）；阈值 95% 表示「已达到或非常接近上限」。VM 维度由 `VM Uncached *Consumed Percentage` 直接给出，不再做「同分钟读+写合计」或「各盘累加」。
+> 步骤 3 查到的 IOPS / 吞吐上限仅用于报告展示对照（让用户看到「消耗 X% 对应绝对 ≤ N IOPS」），不参与触顶判定。
 
-> IOPS / 吞吐峰值一律取「同一分钟内读+写之和的最大值」（同分钟合计），不要用“读峰值+写峰值”跨分钟相加；延迟是单序列，直接取最大。判断只比较「峰值 vs 上限」，报告里不展示利用率百分比。
+## 磁盘 SKU 上限对照表（步骤 3 查表用）
 
-## SKU 上限对照表
-
-单盘 IOPS / 吞吐(MB/s) 上限（数据来源：https://learn.microsoft.com/azure/virtual-machines/disks-types）。
-**「等级」反推规则**：Standard/Premium SSD v1 / HDD 盘的 `tier` 字段常为空，此时用 `sizeGB` 在下表里**向上取整到第一个 ≥ 容量的档位**，该行的「档位」即为等级名（如 512 GB 的 Premium → P20，512 GB 的 Standard HDD → S20），同时取该行 IOPS / MB/s 为上限。
+单盘 IOPS / 吞吐(MB/s) 上限（来源：https://learn.microsoft.com/azure/virtual-machines/disks-types）。
+**「等级」反推**：Standard / Premium SSD v1 / HDD 盘 `tier` 常为空，用 `sizeGB` 向上取整到第一个 ≥ 容量的档位，该行「档位」即等级名，取该行 IOPS/MB/s 为上限。Premium SSD v2 / Ultra 不查表，直接用盘自定义 `diskIOPSReadWrite`/`diskMBpsReadWrite`。
 
 **Premium SSD（P 系）**
 
@@ -198,16 +196,16 @@ VM 级：
 
 ## 判断标准
 
-磁盘只分**正常 / 异常**两档（不设「关注」中间态），以下任一条件命中即判为异常：
+磁盘只分**正常 / 异常**两档（不设中间态），以下任一命中即判异常：
 
 | 结论 | 判定条件 |
 | --- | --- |
-| ✅ 正常 | 所有盘级与 VM 级的 IOPS / 吞吐峰值均**未达到各自上限**，且所有盘延迟峰值 ≤ 200ms |
-| ❌ 异常 | 任一盘级或 VM 级的 IOPS / 吞吐峰值**达到或超过上限**（已触顶），**或** 任一盘延迟峰值 > 200ms |
+| ✅ 正常 | 所有盘的 IOPS / 吞吐消耗百分比峰值、以及 VM 未缓存 IOPS / 吞吐消耗百分比峰值均 < 95%，且所有盘延迟峰值 ≤ 200ms |
+| ❌ 异常 | 任一盘或 VM 未缓存的 IOPS / 吞吐消耗百分比峰值 ≥ 95%（触顶），**或** 任一盘延迟峰值 > 200ms |
 
-- **盘级瓶颈**：某块盘 IOPS 或吞吐峰值达到自身上限 → 该盘已触顶，需升 SKU / 升容量档位。
-- **VM 级瓶颈**：**IOPS 与吞吐两个维度都要判断**——单盘没满但 VM 合计 IOPS 或吞吐任一达到未缓存上限 → VM 规格限制了总 IO，需升 VM SKU。
-- **延迟风险**：任一盘延迟峰值 > 200ms 即判为异常（即使 IOPS / 吞吐未满）→ 可能是 HDD / 低档 SSD 或后端拥塞，建议升 Premium SSD 并排查。
+- **盘级瓶颈**：某块盘 IOPS 或吞吐消耗百分比峰值 ≥ 95% → 该盘已触顶，需升 SKU / 升容量档位。
+- **VM 级瓶颈**：单盘没满但 VM 未缓存 IOPS 或吞吐消耗百分比峰值 ≥ 95% → VM 规格限制了总 IO，需升 VM SKU。
+- **延迟风险**：任一盘延迟峰值 > 200ms 即判为异常（即使消耗百分比未满）→ 可能是 HDD / 低档 SSD 或后端拥塞，建议升 Premium SSD 并排查。
 
 ## 输出格式
 
@@ -227,8 +225,7 @@ VM 级：
   当前状态：<powerState，如 running>
 
 二、结论
-- 是否异常：<✅ 正常 / ❌ 异常>，并简述依据（哪块盘/哪个维度触顶、峰值多少/上限多少、最大延迟多少）。
-- 平台关联：<仅在磁盘判异常时写：诊断窗内有平台事件/当前非 Available → 可能与底层平台有关；无事件且 Available → 已排除平台因素。磁盘正常时此行可省略>
+- 是否异常：<✅ 正常 / ❌ 异常>，并简述依据（哪块盘/哪个维度触顶、消耗百分比峰值多少、最大延迟多少）。
 - 风险判断：<低 / 中 / 高>，一句话说明（如各盘均远低于上限，运行稳定）。
 - 建议动作：1) <可执行建议> 2) <可执行建议>（正常则写「无需处理，继续观察」）。
 - 参考文档：<由你根据结论自行推荐 1 条最相关的 Microsoft Learn 官方文档链接，
@@ -236,53 +233,36 @@ VM 级：
 
 ———— 详细数据 ————
 三、磁盘指标
-  [OS盘] 名称=<盘名>  SKU=<sku>  容量=<sizeGB> GB
-    SKU 上限：IOPS=<上限>，吞吐=<上限> MB/s，等级=<tier>  磁盘类型=<family>
-    IOPS峰值（同分钟合计）：<r+w> IOPS（读 <r> / 写 <w>）时间=<峰值时间>
-    吞吐峰值（同分钟合计）：<rm+wm> MB/s（读 <rm> / 写 <wm>）时间=<峰值时间>
-    磁盘延迟峰值：<lat> ms（时间=<时间>）
+  [OS盘] 名称=<盘名>  SKU=<sku>  容量=<sizeGB> GB  等级=<tier 或反推档位>
+    SKU 上限：IOPS=<上限>，吞吐=<上限> MB/s
+    IOPS 消耗峰值：<p>%（时间=<峰值时间>）
+    吞吐消耗峰值：<p>%（时间=<峰值时间>）
+    延迟峰值：<lat> ms（时间=<峰值时间>）
 
   [数据盘·<tier> / <family> ×<块数>]
-    SKU 上限：IOPS=<上限>，吞吐=<上限> MB/s，等级=<tier>  磁盘类型=<family>
-    · ✅ 全部 <n> 块正常 LUN=<逐块列出 LUN 及容量，如 0(512GB), 1(512GB)>（IOPS 峰值=<值>，延迟峰值=<值>ms）
+    SKU 上限：IOPS=<上限>，吞吐=<上限> MB/s
+    · ✅ 全部 <n> 块正常 LUN=<逐块列出 LUN 及容量，如 0(512GB), 1(512GB)>（<单块直接写 IOPS 消耗峰值=…%，吞吐消耗峰值=…%，延迟峰值=…ms；多块写 组内最高 IOPS 消耗=…%，最高吞吐消耗=…%，最高延迟=…ms>）
 
   [数据盘·<tier> / <family> ×<块数>] 共 <n> 块：⚠️ 异常 <异常数> / ✅ 正常 <正常数>
-    SKU 上限：IOPS=<上限>，吞吐=<上限> MB/s  磁盘类型=<family>（每盘上限）
-    · ⚠️ LUN <lun> 名称=<盘名> 容量=<sizeGB> GB [异常：延迟<lat>ms(>200ms)]
-       IOPS峰值（同分钟合计）：<r+w> IOPS（读 <r> / 写 <w>）时间=<峰值时间>
-       吞吐峰值（同分钟合计）：<rm+wm> MB/s（读 <rm> / 写 <wm>）时间=<峰值时间>
-       磁盘延迟峰值：<lat> ms（时间=<时间>）
+    SKU 上限：IOPS=<上限>，吞吐=<上限> MB/s
+    · ⚠️ LUN <lun> 名称=<盘名> 容量=<sizeGB> GB [异常：<只列超标项，如 IOPS消耗 98%≥95%、延迟 320ms>200ms>]
+       IOPS 消耗峰值：<p>%（时间=<峰值时间>）  吞吐消耗峰值：<p>%（时间=<峰值时间>）  延迟峰值：<lat> ms（时间=<峰值时间>）（上限 <iops> IOPS / <mbps> MB/s）
 
-  【每盘上限可能不同的类型（Premium SSD v2 / Ultra Disk）——逐盘展开，每块标自己的上限，不共用组头上限】
-  [数据盘·<family> ×<块数>] 共 <n> 块：⚠️ 异常 <异常数> / ✅ 正常 <正常数>
-    磁盘类型=<family>（每块盘 IOPS/吞吐由用户单独配置，下方逐盘标注）
-    · ✅ LUN <lun> 名称=<盘名> 容量=<sizeGB> GB（上限 <iops> IOPS / <mbps> MB/s）
-       峰值 IOPS=<实测峰值>，吞吐峰值=<实测> MB/s，延迟峰值=<实测>ms
-    · ⚠️ LUN <lun> 名称=<盘名> 容量=<sizeGB> GB（上限 <iops> IOPS / <mbps> MB/s）[异常：IOPS峰值<r+w>≥上限<iops>]
-       IOPS峰值（同分钟合计）：<r+w> IOPS（读 <r> / 写 <w>）时间=<峰值时间>
-       吞吐峰值（同分钟合计）：<rm+wm> MB/s（读 <rm> / 写 <wm>）时间=<峰值时间>
-       磁盘延迟峰值：<lat> ms（时间=<时间>）
-
-  [VM 级合计] IOPS 峰值=<所有盘合计> IOPS，吞吐峰值=<所有盘合计> MB/s
-  [VM 级未缓存上限] IOPS=<UncachedDiskIOPS>，吞吐=<未缓存吞吐 MB/s> MB/s
+  [VM 级未缓存消耗] IOPS 消耗峰值=<p>%，吞吐消耗峰值=<p>%
 
 四、运行状况（Resource Health）
   诊断窗内平台事件：<无 / 有：简述 time∈[start,end] 的最相关一条（北京时间 + 计划内/计划外 + 简要说明）>
   窗口内平台状态：<窗内有记录→取窗内最新一条 state（Available=正常 / Unavailable / Degraded）；窗内无记录→无平台事件（视为正常）>
 ```
 
-- 数据盘**按「档位 + 磁盘类型」分组**：每组标题行 `[数据盘·<等级> / <类型> ×<块数>]`。
-  - 组内全部正常 → 标题行不加「共 N 块」后缀，正文聚合成一行 `· ✅ 全部 N 块正常 LUN=0(512GB), 1(512GB)…`，**逐块列出 LUN 号与容量**。括号里的峰值：**组内只有 1 块时**直接写该盘的「IOPS 峰值=…，延迟峰值=…ms」；**组内多于 1 块时**才写「组内最高 IOPS 峰值=…，最高延迟峰值=…ms」（表示这组里最高的一块）。
+- 数据盘**按「档位 + 磁盘类型」分组**：每组标题行 `[数据盘·<等级> / <类型> ×<块数>]`（Premium SSD v2 / Ultra 等无 tier 的类型，标题写为 `[数据盘·<类型> ×<块数>]`）。标题下一行统一写该组 `SKU 上限：IOPS=<上限>，吞吐=<上限> MB/s`（同档位同类型上限相同）。
+  - 组内全部正常 → 标题行不加「共 N 块」后缀，正文聚合成一行 `· ✅ 全部 N 块正常 LUN=0(512GB), 1(512GB)…`，**逐块列出 LUN 号与容量**。括号里峰值：**组内只有 1 块**直接写该盘「IOPS 消耗峰值=…%，吞吐消耗峰值=…%，延迟峰值=…ms」；**组内多于 1 块**写「组内最高 IOPS 消耗=…%，最高吞吐消耗=…%，最高延迟=…ms」。
   - 组内有异常 → 标题行加 `共 N 块：⚠️ 异常 X / ✅ 正常 Y`，把**异常盘逐块展开**（每块以 `· ⚠️ LUN …` 起头），正常盘可省略。
-  - `等级`：Premium SSD v2 / Ultra 等无 tier 的类型，SKU 上限行省略「等级=」，标题写为 `[数据盘·<类型> ×<块数>]`。
-- **Premium SSD v2 / Ultra Disk 特别处理**：这两类盘的 IOPS/吞吐是每块盘由用户单独配置的（同一组内可能 LUN1=3000、LUN2=5000 不同），所以：
-  - **不在组头写统一 SKU 上限**（组头只标磁盘类型）；
-  - **一律逐盘展开**（即使全部正常也不聚合成一行），每块盘在本行括号里标出**自己的上限** `（上限 <iops> IOPS / <mbps> MB/s）`；
-  - 上限取自步骤 3 该盘的 `diskIOPSReadWrite`/`diskMBpsReadWrite`；是否触顶用该盘实测峰值与该盘自己的上限直接比较。
-- 异常盘的 `[异常：…]` 只列**真正超标的维度**（延迟 >200ms、IOPS 峰值达到/超过上限、吞吐峰值达到/超过上限），写成「峰值≥上限」的直观对比，**不要用百分比利用率**。多项用中文逗号分隔。
-- **不要在报告里展示「利用率」百分比**；是否异常只靠「峰值 vs 上限」和「延迟 vs 200ms」判定，呈现给用户的是峰值与上限的原始数值。
-- IOPS / 吞吐峰值一律取「同分钟合计」（同一分钟内读+写之和的最大值），读/写明细为该峰值分钟的读值与写值；延迟为单序列峰值。
-- **逐块盘明细里的 IOPS / 吞吐 / 延迟峰值是该盘的确定实测值，一律用「=」直接写数值，禁止用「≤」**（「≤」无意义：峰值就是峰值）。只有把**多块盘**聚合成一行时，才用「组内最高 …峰值=<组内最大值>」表示这组里最高的一块；单块盘直接写该盘峰值，不用「组内最高」。
+  - **Premium SSD v2 / Ultra**：每块盘上限为用户自定义且可能不同，组头不写统一 `SKU 上限`行，改在每块行末尾标注该盘上限（取 6a 返回的 `iops`/`mbps`）。
+  - **异常盘明细行末尾的 `（上限 <iops> IOPS / <mbps> MB/s）` 要填该盘实际上限**：Premium SSD v2 / Ultra 取 6a 的 `iops`/`mbps`；**Premium SSD v1 / Standard SSD / Standard HDD 这些类型 `iops`/`mbps` 为 null，要取「SKU 上限对照表」查出的上限（即组标题 `SKU 上限` 行同一个数），不要写 N/A**。
+- 异常盘的 `[异常：…]` 只列**真正超标的维度**（IOPS 消耗 ≥ 95%、吞吐消耗 ≥ 95%、延迟 > 200ms），写成「消耗 X%≥95%」「延迟 Xms>200ms」的直观对比。多项用中文逗号分隔。
+- IOPS / 吞吐的**绝对上限**由步骤 3 查 SKU 得出并展示（仅作对照），**触顶判定以消耗百分比为准**；无需逐分钟读写累加、无需 VM 合计。
+- 逐块盘明细里的消耗百分比 / 延迟峰值是该盘的确定实测值，一律用「=」直接写数值，禁用「≤」；仅把**多块盘**聚合成一行时才用「组内最高 …=<组内最大值>」。
 - 数值保留 1 位小数；时间格式 `YYYY-MM-DD HH:MM:SS`；取不到的值写 N/A，不臆造。
 - **「一、主机信息」的机型 SKU 行必须完整列出括号内的 vCPU / 内存**（来自步骤 2），不得只写 SKU 名而省略规格；取不到才写 N/A。
 

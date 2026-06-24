@@ -15,7 +15,8 @@ description: >-
 
 > 只读取 Azure 控制面的网络配置与平台指标（带宽 `Network In/Out Total`、连接数 `Inbound/Outbound Flows`），
 > **不进入 VM 操作系统内部**（不执行 run-command、不看 netstat / ss）。OS 级连接根因不在本技能范围。
-> 启用加速连接（AC）的 VM，连接数指标改从主 NIC 资源读取（VM 聚合值在 AC 模式下不再代表真实并发）。
+> 连接数：**未开 AC** 从 VM 资源取（`Inbound Flows` / `Outbound Flows`）；**已开 AC** 从主 NIC 资源取（`CurrentTotalFlowsIn` / `CurrentTotalFlowsOut`）。
+> ⚠️ 用完整 NIC `id` 作 `--resource` 时**不要再带 `--resource-type`**（两者同时给会触发 az usage error）。
 
 ## 工具：run_az
 
@@ -47,6 +48,8 @@ az vm show -d -g <rg> -n <vm> --query "{id:id, name:name, location:location, vmS
 
 从结果取：`name`、`location`、`vmSize`、`powerState`（展示时去掉前缀 `VM ` → `running`）、`id`（资源 ID，形如 `/subscriptions/<subId>/resourceGroups/...`，下一步取 `<subId>`）。
 从 `nics` 里挑出**主网卡**：优先 `primary==true` 的那张；若都没标 primary 就取第一张。记下它的 `id`（完整资源 ID，下一步用）。
+
+> ⚠️ 主网卡 `id` 必须从本命令返回的 `nics[].id` 原值逐字照抄（大小写敏感）。Azure 资源名区分大小写，NIC 名与 VM 名没有固定规律（常见如 `<vm名小写>_z1`，但不可靠），**绝不要用 VM 名拼接 / 小写化猜 NIC 名**，否则步骤 3 会 NOT_FOUND。
 
 确认 VM 存在后，再执行一条取**当前主机名**（Guest Agent 上报的 OS 主机名，对应门户「计算机名称」，与实例 ID / 资源名不同）：
 
@@ -111,9 +114,10 @@ az monitor metrics list --resource <vm> --resource-group <rg> --resource-type Mi
   用步骤 1 的主网卡 `id` 作为 `--resource`：
 
   ```
-  az monitor metrics list --resource <primaryNicId> --resource-type Microsoft.Network/networkInterfaces --metric "CurrentTotalFlowsIn" "CurrentTotalFlowsOut" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, peak:max_by(timeseries[0].data[?maximum!=null], &maximum)}" -o json
+  az monitor metrics list --resource <primaryNicId> --metric "CurrentTotalFlowsIn" "CurrentTotalFlowsOut" --start-time <start-utc> --end-time <end-utc> --interval PT1M --aggregation Maximum --query "value[].{m:name.value, peak:max_by(timeseries[0].data[?maximum!=null], &maximum)}" -o json
   ```
 
+  ⚠️ 这里用的是**完整 NIC `id`**，所以**不带 `--resource-type`**（完整 ID + `--resource-type` 会报 usage error）。
   把 `CurrentTotalFlowsIn` 当作入站连接、`CurrentTotalFlowsOut` 当作出站连接，数据来源标记为 **NIC**。
 
 **同样用 `max_by(...)` 让 az 服务端直接返回峰值点，不要改成返回整段序列。**
@@ -228,8 +232,7 @@ az rest --method get --url "https://management.azure.com/subscriptions/<subId>/r
 ## 注意事项
 
 - 本技能为**只读诊断**，不修改任何资源、不进入 VM 内部；`run_az` 只允许只读命令。
-- 启用加速连接（AC）的 VM，连接数取自**主 NIC** 指标（`CurrentTotalFlowsIn/Out`），已映射为 VM 端口径（入/出站连接）；
-  此时不要再用 VM 上的 `Inbound/Outbound Flows`（AC 模式下不代表真实并发）。
+- 连接数：未开 AC 取 VM 的 `Inbound/Outbound Flows`；已开 AC 取主 NIC 的 `CurrentTotalFlowsIn/Out`（用完整 NIC `id` 作 `--resource`，**不带 `--resource-type`**）；
 - 时间一律按北京时间向用户呈现；调用 az 时换算为 UTC。
 - 若指标缺失（VM 已释放 / 未装 Azure Monitor Agent / 该 SKU 不暴露连接数指标），如实告知用户，相应数值写 N/A，不要编造。
 - 主机名必填；资源组缺省时使用默认资源组 `xiaomi-azure`，不要追问。

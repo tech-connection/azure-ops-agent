@@ -82,17 +82,38 @@ def _flag_value(args: list[str], flag: str) -> str | None:
     return None
 
 
+# Resource Graph 查询端点：HTTP 方法是 POST，但语义为**只读查询**（KQL 只能读资源、不能改），
+# 门户「计算机名」等筛选即走此端点。无原生只读 az 子命令、resource-graph 扩展在部分环境装不上，
+# 故特例放行该端点的 POST + body（仅此端点，其余 az rest 仍强制只读 GET）。
+_ARG_RESOURCES_URL = "https://management.azure.com/providers/microsoft.resourcegraph/resources"
+
+
 def _validate_rest(args: list[str]) -> str | None:
-    """`az rest` 仅放行只读 GET：method 必须是 get、URL 必须指向 ARM 管理面、禁止写 body。"""
+    """`az rest` 放行两类：
+    ① 任意 `https://management.azure.com/` 的只读 GET（禁 body/headers/input-file）；
+    ② Resource Graph 查询端点的只读 POST（HTTP POST 但语义只读，用于按计算机名等反查资源）。
+    其余一律拒绝。"""
     method = (_flag_value(args, "--method") or _flag_value(args, "-m") or "get").lower()
+    url = _flag_value(args, "--url") or _flag_value(args, "-u") or ""
+    url_l = url.lower()
+
+    # ② Resource Graph 只读查询（POST + body）：仅精确匹配该端点放行
+    if url_l.split("?", 1)[0] == _ARG_RESOURCES_URL:
+        if method != "post":
+            return f"拒绝执行：Resource Graph 查询需 --method post（语义只读），收到 {method!r}"
+        # ARG 端点只做查询、无写语义；放行 --body/--headers，但禁止从本地文件读输入
+        if any(a == "--input-file" or a.startswith("--input-file=") for a in args):
+            return "拒绝执行：az rest 不允许携带 --input-file"
+        return None
+
+    # ① 通用只读 GET
     if method != "get":
         return f"拒绝执行：az rest 仅允许 --method get（本工具只读），收到 {method!r}"
     for f in ("--body", "--input-file", "--headers"):
         # 禁止携带请求体/输入文件（避免任何写操作）；headers 也一并禁止以收敛攻击面。
         if any(a == f or a.startswith(f + "=") for a in args):
             return f"拒绝执行：az rest 不允许携带 {f}"
-    url = _flag_value(args, "--url") or _flag_value(args, "-u") or ""
-    if not url.lower().startswith("https://management.azure.com/"):
+    if not url_l.startswith("https://management.azure.com/"):
         return "拒绝执行：az rest 仅允许访问 https://management.azure.com/ 的只读接口"
     return None
 
@@ -133,7 +154,7 @@ def _validate_readonly(args: list[str]) -> str | None:
     return None
 
 
-_MAX_OUTPUT_CHARS = 20000
+_MAX_OUTPUT_CHARS = 150000
 
 
 @tool(

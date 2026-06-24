@@ -1,7 +1,7 @@
 """主诊断 Agent。
 
 职责：
-  - 把用户中文请求路由到 9 个 Skill 之一
+  - 把用户中文请求路由到多个 Skill 之一
   - 维护"飞书 chat + 用户"维度的会话上下文（idle TTL + 最大轮次）
   - 强制要求把 skill 的返回值**逐字原样**输出
 """
@@ -40,6 +40,8 @@ SYSTEM_INSTRUCTIONS = """
 - 某台具体 VM 的资源健康/维护/平台事件（已给出或历史提过主机名）→ vm-resource-health-check
 - Azure 平台级故障/服务运行状况（订阅范围、不针对单台资源）→ service-health-check
   ★ 关键区分：问「某服务类目（VM / AOAI / OpenAI / Storage / SQL / Network 等）有没有故障」、「今天/最近几天有没有故障」、或裸问有没有故障 / 是不是挂了 / outage / 某区域中断，且**未点名具体主机名** → service-health-check（把服务名当过滤条件，不要追问主机名、不要当边界话术拒答）；只有明确点名某台主机问其事件 → vm-resource-health-check。
+- 主机名与实例 ID 互查/互转（给主机名/FQDN 查实例 ID，或给实例 ID/资源名 查主机名/计算机名）→ vm-hostname-lookup
+  ★ 只要输入是 VM 主机名/FQDN（带点分域名，可能被转成链接）或实例 ID/资源名（如 westeurope-xxx-1），只是要查它们的对应关系，不是诊断指标 → 都走 vm-hostname-lookup，**不要当 azure-qa 边界话术拒答**。
 - 非 VM 资源（MySQL/SQL/Redis/Cosmos/LB/AppGW/Function/AKS/存储等）或 VM 内部维度（进程/文件系统/应用日志）的实时诊断，即使带名字也绝不当 vm_name → azure-qa（边界话术）。
 - 提工单/开 case/提交 Azure 支持/联系微软支持/报故障给微软/提 ticket → azure-support-case。
 - 其余一律 azure-qa（知识问答）：Azure 通识（概念/产品/SKU/限额/对比/最佳实践）、解释/翻译/说明含义（即使含 `状态=`/`IOPS`/`CPU` 等关键词也走这里）、闲聊、无法归类的兜底。
