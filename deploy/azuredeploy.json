@@ -10,7 +10,6 @@
       "defaultValue": "azure-vm-diagnosis-agent",
       "minLength": 1,
       "maxLength": 64,
-      "allowedPattern": "^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,62}[a-zA-Z0-9])$",
       "metadata": {
         "description": "虚拟机名称，1-64 位；使用字母、数字和连字符，不能以连字符开头或结尾"
       }
@@ -87,7 +86,7 @@
   "variables": {
     "location": "[resourceGroup().location]",
     "adminUsername": "azureagent",
-    "vmSize": "Standard_B2s",
+    "vmSize": "Standard_D2s_v5",
     "publicIpName": "[concat(parameters('vmName'), '-pip')]",
     "nicName": "[concat(parameters('vmName'), '-nic')]",
     "subnetResourceId": "[resourceId(subscription().subscriptionId, parameters('existingVnetResourceGroup'), 'Microsoft.Network/virtualNetworks/subnets', parameters('existingVnetName'), parameters('existingSubnetName'))]",
