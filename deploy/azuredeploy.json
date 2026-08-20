@@ -23,9 +23,8 @@
     },
     "existingVnetResourceGroup": {
       "type": "string",
-      "defaultValue": "[resourceGroup().name]",
       "metadata": {
-        "description": "现有虚拟网络所在的资源组名称；默认使用当前部署资源组"
+        "description": "现有虚拟网络所在的资源组名称，例如 self-learning"
       }
     },
     "existingVnetName": {
