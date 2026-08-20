@@ -10,6 +10,8 @@
 
 VM 名称由用户填写，支持 1-64 位字母、数字和连字符，不能以连字符开头或结尾。VM 规格固定为 `Standard_B2s`（2 vCPU、4 GiB 内存）。部署过程中会自动安装 Azure CLI、Python 依赖和 Agent，并配置 systemd 开机自启。
 
+`Azure OpenAI Deployment` 填模型部署名称（例如 `gpt-5.4`），`Azure OpenAI API Version` 填该 Endpoint 支持的接口版本，默认 `2024-10-21`。
+
 部署完成后，从部署输出获取公网 IP，登录 VM：
 
 ```bash
