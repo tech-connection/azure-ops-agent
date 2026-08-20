@@ -6,7 +6,9 @@
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Ftech-connection%2Fazure-ops-agent%2Fmain%2Fdeploy%2Fazuredeploy.json)
 
-点击按钮将跳转到 Azure Portal；如果尚未登录，Azure 会先要求登录。模板复用已有子网及其网络安全组，并创建公网 IP、网卡和 Ubuntu VM。部署过程中会自动安装 Azure CLI、Python 依赖和 Agent，并配置 systemd 开机自启。
+点击按钮将跳转到 Azure Portal；如果尚未登录，Azure 会先要求登录。填写现有虚拟网络所在资源组、虚拟网络名称和子网名称即可，无需手工拼接子网资源 ID。模板复用已有子网及其网络安全组，并创建公网 IP、网卡和 Ubuntu VM。
+
+VM 名称由用户填写，支持 1-64 位字母、数字和连字符，不能以连字符开头或结尾。VM 规格固定为 `Standard_B2s`（2 vCPU、4 GiB 内存）。部署过程中会自动安装 Azure CLI、Python 依赖和 Agent，并配置 systemd 开机自启。
 
 部署完成后，从部署输出获取公网 IP，登录 VM：
 

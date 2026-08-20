@@ -8,8 +8,11 @@
     "vmName": {
       "type": "string",
       "defaultValue": "azure-vm-diagnosis-agent",
+      "minLength": 1,
+      "maxLength": 64,
+      "allowedPattern": "^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,62}[a-zA-Z0-9])$",
       "metadata": {
-        "description": "虚拟机名称"
+        "description": "虚拟机名称，1-64 位；使用字母、数字和连字符，不能以连字符开头或结尾"
       }
     },
     "adminPassword": {
@@ -18,10 +21,23 @@
         "description": "azureagent 用户密码，至少 12 位并满足 Azure 密码复杂度要求"
       }
     },
-    "existingSubnetResourceId": {
+    "existingVnetResourceGroup": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().name]",
+      "metadata": {
+        "description": "现有虚拟网络所在的资源组名称；默认使用当前部署资源组"
+      }
+    },
+    "existingVnetName": {
       "type": "string",
       "metadata": {
-        "description": "现有子网资源 ID，例如 /subscriptions/.../resourceGroups/.../providers/Microsoft.Network/virtualNetworks/.../subnets/..."
+        "description": "现有虚拟网络名称，例如 self-learning-vnet"
+      }
+    },
+    "existingSubnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "现有子网名称，例如 default"
       }
     },
     "azureSubscriptionId": {
@@ -68,6 +84,7 @@
     "vmSize": "Standard_B2s",
     "publicIpName": "[concat(parameters('vmName'), '-pip')]",
     "nicName": "[concat(parameters('vmName'), '-nic')]",
+    "subnetResourceId": "[resourceId(subscription().subscriptionId, parameters('existingVnetResourceGroup'), 'Microsoft.Network/virtualNetworks/subnets', parameters('existingVnetName'), parameters('existingSubnetName'))]",
     "installScript": "[base64(concat('#!/bin/bash\nset -euo pipefail\nexec > /var/log/azure-vm-diagnosis-agent-deploy.log 2>&1\necho \"Deployment started: $(date -Is)\"\nexport DEBIAN_FRONTEND=noninteractive\nAPP_DIR=/opt/azure-vm-diagnosis-agent\nAPP_USER=', variables('adminUsername'), '\napt-get update -y\napt-get install -y ca-certificates curl git python3 python3-venv python3-pip\ncurl -sL https://aka.ms/InstallAzureCLIDeb | bash\ngit clone --branch main https://github.com/tech-connection/azure-ops-agent.git \"$APP_DIR\"\ncd \"$APP_DIR\"\npython3 -m venv .venv\n.venv/bin/pip install --upgrade pip\n.venv/bin/pip install -r requirements.txt\ncat > .env <<''ENVEOF''\nAZURE_SUBSCRIPTION_ID=', parameters('azureSubscriptionId'), '\nAZURE_AUTH_MODE=cli\nAZURE_OPENAI_ENDPOINT=', parameters('azureOpenaiEndpoint'), '\nAZURE_OPENAI_API_KEY=', parameters('azureOpenaiApiKey'), '\nAZURE_OPENAI_API_VERSION=preview\nAZURE_OPENAI_DEPLOYMENT=', parameters('azureOpenaiDeployment'), '\nFEISHU_APP_ID=', parameters('feishuAppId'), '\nFEISHU_APP_SECRET=', parameters('feishuAppSecret'), '\nAPP_LOG_LEVEL=INFO\nENVEOF\nchmod 600 .env\nmkdir -p logs /home/', variables('adminUsername'), '/.azure\ncat > /etc/systemd/system/azure-vm-diagnosis-agent.service <<''SVCEOF''\n[Unit]\nDescription=Azure VM Diagnosis Agent (Feishu Long Connection)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=', variables('adminUsername'), '\nWorkingDirectory=/opt/azure-vm-diagnosis-agent\nEnvironment=HOME=/home/', variables('adminUsername'), '\nEnvironment=AZURE_CONFIG_DIR=/home/', variables('adminUsername'), '/.azure\nEnvironment=PYTHONUNBUFFERED=1\nExecStart=/opt/azure-vm-diagnosis-agent/.venv/bin/python -m app.main\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\nSVCEOF\nchown -R \"$APP_USER:$APP_USER\" \"$APP_DIR\" /home/', variables('adminUsername'), '/.azure\nsystemctl daemon-reload\nsystemctl enable --now azure-vm-diagnosis-agent\necho \"Deployment finished: $(date -Is)\"\n'))]"
   },
   "resources": [
@@ -98,7 +115,7 @@
             "properties": {
               "privateIPAllocationMethod": "Dynamic",
               "subnet": {
-                "id": "[parameters('existingSubnetResourceId')]"
+                "id": "[variables('subnetResourceId')]"
               },
               "publicIPAddress": {
                 "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]"
