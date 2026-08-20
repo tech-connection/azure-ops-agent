@@ -2,6 +2,28 @@
 
 通过飞书机器人对话，对 Azure 虚拟机做**只读**健康诊断。用户用中文提问，Agent 自动路由到对应技能，按技能内置的 `az` 命令实时采集 Azure Monitor / Resource Health 指标，组装成中文诊断报告返回。
 
+## 一键部署到 Azure VM
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Ftech-connection%2Fazure-ops-agent%2Fmain%2Fdeploy%2Fazuredeploy.json)
+
+点击按钮将跳转到 Azure Portal；如果尚未登录，Azure 会先要求登录。模板复用已有子网及其网络安全组，并创建公网 IP、网卡和 Ubuntu VM。部署过程中会自动安装 Azure CLI、Python 依赖和 Agent，并配置 systemd 开机自启。
+
+部署完成后，从部署输出获取公网 IP，登录 VM：
+
+```bash
+ssh azureagent@<公网IP>
+```
+
+在 VM 内使用获得目标订阅读取权限的用户完成 Azure CLI 登录，然后重启服务：
+
+```bash
+az login --use-device-code --tenant <租户ID>
+az account set --subscription <目标订阅ID>
+sudo systemctl restart azure-vm-diagnosis-agent
+```
+
+模板使用 `AZURE_AUTH_MODE=cli`，不创建或接收 Service Principal。Azure CLI 登录缓存保存在 `azureagent` 用户的 `~/.azure` 中，访问令牌到期后会自动刷新；如果目标租户撤销会话或要求重新认证，需要再次运行上述登录命令。
+
 ## 特性
 
 - **纯只读**：只查询 Azure 控制面指标与健康事件，不修改任何资源、不进入 VM 操作系统内部。

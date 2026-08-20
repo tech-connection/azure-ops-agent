@@ -1,0 +1,180 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Azure VM Diagnosis Agent - deploy to an Ubuntu VM in an existing subnet"
+  },
+  "parameters": {
+    "vmName": {
+      "type": "string",
+      "defaultValue": "azure-vm-diagnosis-agent",
+      "metadata": {
+        "description": "虚拟机名称"
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "azureagent 用户密码，至少 12 位并满足 Azure 密码复杂度要求"
+      }
+    },
+    "existingSubnetResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "现有子网资源 ID，例如 /subscriptions/.../resourceGroups/.../providers/Microsoft.Network/virtualNetworks/.../subnets/..."
+      }
+    },
+    "azureSubscriptionId": {
+      "type": "string",
+      "metadata": {
+        "description": "Agent 要诊断的目标 Azure 订阅 ID"
+      }
+    },
+    "azureOpenaiEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure OpenAI Endpoint，例如 https://example.openai.azure.com/"
+      }
+    },
+    "azureOpenaiApiKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Azure OpenAI API Key"
+      }
+    },
+    "azureOpenaiDeployment": {
+      "type": "string",
+      "defaultValue": "gpt-4.1",
+      "metadata": {
+        "description": "Azure OpenAI 模型部署名称"
+      }
+    },
+    "feishuAppId": {
+      "type": "string",
+      "metadata": {
+        "description": "飞书应用 App ID"
+      }
+    },
+    "feishuAppSecret": {
+      "type": "securestring",
+      "metadata": {
+        "description": "飞书应用 App Secret"
+      }
+    }
+  },
+  "variables": {
+    "location": "[resourceGroup().location]",
+    "adminUsername": "azureagent",
+    "vmSize": "Standard_B2s",
+    "publicIpName": "[concat(parameters('vmName'), '-pip')]",
+    "nicName": "[concat(parameters('vmName'), '-nic')]",
+    "installScript": "[base64(concat('#!/bin/bash\nset -euo pipefail\nexec > /var/log/azure-vm-diagnosis-agent-deploy.log 2>&1\necho \"Deployment started: $(date -Is)\"\nexport DEBIAN_FRONTEND=noninteractive\nAPP_DIR=/opt/azure-vm-diagnosis-agent\nAPP_USER=', variables('adminUsername'), '\napt-get update -y\napt-get install -y ca-certificates curl git python3 python3-venv python3-pip\ncurl -sL https://aka.ms/InstallAzureCLIDeb | bash\ngit clone --branch main https://github.com/tech-connection/azure-ops-agent.git \"$APP_DIR\"\ncd \"$APP_DIR\"\npython3 -m venv .venv\n.venv/bin/pip install --upgrade pip\n.venv/bin/pip install -r requirements.txt\ncat > .env <<''ENVEOF''\nAZURE_SUBSCRIPTION_ID=', parameters('azureSubscriptionId'), '\nAZURE_AUTH_MODE=cli\nAZURE_OPENAI_ENDPOINT=', parameters('azureOpenaiEndpoint'), '\nAZURE_OPENAI_API_KEY=', parameters('azureOpenaiApiKey'), '\nAZURE_OPENAI_API_VERSION=preview\nAZURE_OPENAI_DEPLOYMENT=', parameters('azureOpenaiDeployment'), '\nFEISHU_APP_ID=', parameters('feishuAppId'), '\nFEISHU_APP_SECRET=', parameters('feishuAppSecret'), '\nAPP_LOG_LEVEL=INFO\nENVEOF\nchmod 600 .env\nmkdir -p logs /home/', variables('adminUsername'), '/.azure\ncat > /etc/systemd/system/azure-vm-diagnosis-agent.service <<''SVCEOF''\n[Unit]\nDescription=Azure VM Diagnosis Agent (Feishu Long Connection)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=', variables('adminUsername'), '\nWorkingDirectory=/opt/azure-vm-diagnosis-agent\nEnvironment=HOME=/home/', variables('adminUsername'), '\nEnvironment=AZURE_CONFIG_DIR=/home/', variables('adminUsername'), '/.azure\nEnvironment=PYTHONUNBUFFERED=1\nExecStart=/opt/azure-vm-diagnosis-agent/.venv/bin/python -m app.main\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\nSVCEOF\nchown -R \"$APP_USER:$APP_USER\" \"$APP_DIR\" /home/', variables('adminUsername'), '/.azure\nsystemctl daemon-reload\nsystemctl enable --now azure-vm-diagnosis-agent\necho \"Deployment finished: $(date -Is)\"\n'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('publicIpName')]",
+      "location": "[variables('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static"
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('nicName')]",
+      "location": "[variables('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]"
+      ],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[parameters('existingSubnetResourceId')]"
+              },
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('vmName')]",
+      "location": "[variables('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[variables('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[parameters('vmName')]",
+          "adminUsername": "[variables('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": false
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "ubuntu-24_04-lts",
+            "sku": "server",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "diskSizeGB": 30,
+            "managedDisk": {
+              "storageAccountType": "StandardSSD_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines/extensions",
+      "apiVersion": "2024-03-01",
+      "name": "[concat(parameters('vmName'), '/bootstrap')]",
+      "location": "[variables('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+      ],
+      "properties": {
+        "publisher": "Microsoft.Azure.Extensions",
+        "type": "CustomScript",
+        "typeHandlerVersion": "2.1",
+        "autoUpgradeMinorVersion": true,
+        "protectedSettings": {
+          "commandToExecute": "[concat('echo ', variables('installScript'), ' | base64 -d | bash')]"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "publicIpAddress": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '2023-11-01').ipAddress]"
+    }
+  }
+}
